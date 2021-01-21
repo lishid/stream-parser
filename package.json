@@ -34,12 +34,12 @@
     "lezer-tree": "^0.13.0"
   },
   "devDependencies": {
-    "rollup": "^2.35.1",
-    "rollup-plugin-dts": "^2.0.1",
-    "typescript": "^4.1.3",
     "@types/mocha": "^5.2.0",
     "ist": "^1.1.6",
-    "mocha": "^7.1.1"
+    "mocha": "^7.1.1",
+    "rollup": "^2.35.1",
+    "rollup-plugin-dts": "^2.0.1",
+    "typescript": "^4.1.3"
   },
   "repository": {
     "type": "git",

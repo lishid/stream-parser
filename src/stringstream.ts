@@ -26,7 +26,8 @@ export class StringStream {
     public string: string,
     private tabSize: number,
     /// The current indent unit size.
-    public indentUnit: number
+    public indentUnit: number,
+    public lookAhead: (n: number) => string,
   ) {}
 
   /// True if we are at the end of the line.

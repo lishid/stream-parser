@@ -1,9 +1,10 @@
-import {Tree, TreeFragment, NodeType, NodeSet, SyntaxNode, PartialParse} from "lezer-tree"
+import { Decoration, EditorView, ViewPlugin, ViewUpdate, DecorationSet } from '@codemirror/view'
+import {Tree, TreeFragment, NodeType, NodeSet, SyntaxNode, PartialParse, NodeProp} from "lezer-tree"
 import {Input} from "lezer"
-import {Tag, tags, styleTags} from "@codemirror/highlight"
 import {Language, defineLanguageFacet, languageDataProp, IndentContext, indentService,
         EditorParseContext, getIndentUnit, syntaxTree} from "@codemirror/language"
-import {EditorState, Facet} from "@codemirror/state"
+import {EditorState, Facet, Prec} from "@codemirror/state"
+import {RangeSetBuilder} from "@codemirror/rangeset"
 import {StringStream} from "./stringstream"
 
 export {StringStream}
@@ -84,14 +85,15 @@ export class StreamLanguage<State> extends Language {
     let tree = syntaxTree(cx.state), at: SyntaxNode | null = tree.resolve(pos)
     while (at && at.type != this.topNode) at = at.parent
     if (!at) return null
-    let start = findState(this, tree, 0, at.from, pos), statePos, state
+    let start = findState(this, tree, 0, at.from, pos), statePos: number, state
     if (start) { state = start.state; statePos = start.pos + 1 }
     else { state = this.streamParser.startState(cx.unit) ; statePos = 0 }
     if (pos - statePos > C.MaxIndentScanDist) return null
     while (statePos < pos) {
       let line = cx.state.doc.lineAt(statePos), end = Math.min(pos, line.to)
       if (line.length) {
-        let stream = new StringStream(line.text, cx.state.tabSize, cx.unit)
+        let lookahead = (n: number) => cx.state.doc.line(n + line.number).text
+        let stream = new StringStream(line.text, cx.state.tabSize, cx.unit, lookahead)
         while (stream.pos < end - line.from)
           readToken(this.streamParser.token, stream, state)
       } else {
@@ -187,14 +189,49 @@ class Parse<State> implements PartialParse {
 
   parseLine() {
     let line = this.input.lineAfter(this.pos), {streamParser} = this.lang
-    let stream = new StringStream(line, this.context ? this.context.state.tabSize : 4, getIndentUnit(this.context.state))
+    let lookahead = (n: number) => {
+      let pos = this.pos
+      for (let i = 0; i < n; i++) {
+        pos += this.input.lineAfter(pos).length
+        if (pos < this.input.length) pos++
+      }
+      return this.input.lineAfter(pos)
+    }
+    let stream = new StringStream(line, this.context ? this.context.state.tabSize : 4, getIndentUnit(this.context.state), lookahead)
     if (stream.eol()) {
       streamParser.blankLine(this.state, stream.indentUnit)
     } else {
+      let lineClasses: string[] = []
+      let chunks = [];
+      let last = null;
       while (!stream.eol()) {
         let token = readToken(streamParser.token, stream, this.state)
-        if (token)
-          this.chunk.push(tokenID(token), this.pos + stream.start, this.pos + stream.pos, 4)
+        if (token) {
+          let classes = token.split(' ').filter(t => {
+            if (!t) return false
+            let lineClass = t.match(/(?:^|\s+)line-(background-)?(\S+)/)
+            if (lineClass) {
+              lineClasses.push(lineClass[2])
+              return false
+            }
+            return true
+          })
+          let cls = classes.sort().join(' ')
+          let from = this.pos + stream.start
+          let to = this.pos + stream.pos
+          if (last && last.cls === cls && last.to === from) {
+            last.to = to
+          } else {
+            last = {cls, from, to}
+            chunks.push(last)
+          }
+        }
+      }
+      for (let chunk of chunks) {
+        this.chunk.push(tokenID(chunk.cls), chunk.from, chunk.to, 4)
+      }
+      if (lineClasses.length > 0) {
+        this.chunk.push(tokenID(lineClasses.join(' '), true), this.pos, this.pos + line.length, (chunks.length + 1) * 4)
       }
     }
     this.pos += line.length
@@ -239,53 +276,16 @@ function readToken<State>(token: (stream: StringStream, state: State) => string 
 const tokenTable: {[name: string]: number} = Object.create(null)
 const typeArray: NodeType[] = [NodeType.none]
 const nodeSet = new NodeSet(typeArray)
-const warned: string[] = []
 
-function tokenID(tag: string): number {
-  return !tag ? 0 : tokenTable[tag] || (tokenTable[tag] = createTokenType(tag))
+function tokenID(tag: string, lineMode?: boolean): number {
+  return !tag ? 0 : tokenTable[tag] || (tokenTable[tag] = createTokenType(tag, lineMode))
 }
 
-for (let [legacyName, name] of [
-  ["variable", "variableName"],
-  ["variable-2", "variableName.special"],
-  ["string-2", "string.special"],
-  ["def", "variableName.definition"],
-  ["tag", "typeName"],
-  ["attribute", "propertyName"],
-  ["type", "typeName"],
-  ["builtin", "variableName.standard"],
-  ["qualifier", "modifier"],
-  ["error", "invalid"],
-  ["header", "heading"],
-  ["property", "propertyName"]
-]) tokenTable[legacyName] = tokenID(name)
-
-function warnForPart(part: string, msg: string) {
-  if (warned.indexOf(part) > -1) return
-  warned.push(part)
-  console.warn(msg)
-}
-
-function createTokenType(tagStr: string) {
-  let tag = null
-  for (let part of tagStr.split(".")) {
-    let value = (tags as any)[part]
-    if (!value) {
-      warnForPart(part, `Unknown highlighting tag ${part}`)
-    } else if (typeof value == "function") {
-      if (!tag) warnForPart(part, `Modifier ${part} used at start of tag`)
-      else tag = value(tag) as Tag
-    } else {
-      if (tag) warnForPart(part, `Tag ${part} used as modifier`)
-      else tag = value as Tag
-    }
-  }
-  if (!tag) return 0
-
+function createTokenType(tagStr: string, lineMode?: boolean) {
   let name = tagStr.replace(/ /g, "_"), type = NodeType.define({
     id: typeArray.length,
     name,
-    props: [styleTags({[name]: tag})]
+    props: [lineMode ? lineClassNodeProp.add({[name]: tagStr}) : tokenClassNodeProp.add({[name]: tagStr})]
   })
   typeArray.push(type)
   return type.id
@@ -296,3 +296,67 @@ function docID(data: Facet<{[name: string]: any}>) {
   typeArray.push(type)
   return type
 }
+
+// The NodeProp that holds the css class we want to apply
+export const tokenClassNodeProp = new NodeProp<string>()
+export const lineClassNodeProp = new NodeProp<string>()
+
+class LineHighlighter {
+  decorations: DecorationSet
+  tree: Tree
+  lineCache: {[cls: string]: Decoration} = Object.create(null)
+  tokenCache: {[cls: string]: Decoration} = Object.create(null)
+
+  constructor(view: EditorView) {
+    this.tree = syntaxTree(view.state)
+    this.decorations = this.buildDeco(view)
+  }
+
+  update(update: ViewUpdate) {
+    let tree = syntaxTree(update.state)
+    if (tree.length < update.view.viewport.to) {
+      this.decorations = this.decorations.map(update.changes)
+    } else if (tree != this.tree || update.viewportChanged) {
+      this.tree = tree
+      this.decorations = this.buildDeco(update.view)
+    }
+  }
+
+  buildDeco(view: EditorView) {
+    if (!this.tree.length) return Decoration.none
+
+    let builder = new RangeSetBuilder<Decoration>()
+    let lastPos = 0;
+    for (let {from, to} of view.visibleRanges) {
+      this.tree.iterate({
+        from, to,
+        enter: (type, start, end) => {
+          let lineStyle = type.prop(lineClassNodeProp)
+          if (lineStyle) {
+            let lineDeco = this.lineCache[lineStyle] || (this.lineCache[lineStyle] = Decoration.line({attributes:{class: lineStyle}}))
+            let newFrom = view.visualLineAt(start).from
+            // Ignore line modes that start from the middle of the line text
+            if (lastPos > newFrom) {
+              return;
+            }
+            builder.add(newFrom, newFrom, lineDeco)
+            lastPos = newFrom;
+          }
+
+          let tokenStyle = type.prop(tokenClassNodeProp)
+          if (tokenStyle) {
+            let lineDeco = this.tokenCache[tokenStyle] || (this.tokenCache[tokenStyle] = Decoration.mark({class: tokenStyle.split(' ').map(c => 'cm-' + c).join(' ')}))
+            builder.add(start, end, lineDeco)
+            lastPos = end;
+          }
+        }
+      })
+    }
+    return builder.finish()
+  }
+}
+
+// This extension installs a highlighter that highlights lines based on the node prop above
+export const lineHighlighter = Prec.fallback(ViewPlugin.define(view => new LineHighlighter(view), {
+  decorations: v => v.decorations
+}))
